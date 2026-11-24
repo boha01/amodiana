@@ -1,0 +1,59 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install NDK and CMake
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.4
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Fetch And64InlineHook (ARM64)
+        run: |
+          rm -rf /tmp/And64InlineHook
+          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git /tmp/And64InlineHook
+          mkdir -p app/src/main/cpp/and64
+          cp /tmp/And64InlineHook/And64InlineHook.hpp app/src/main/cpp/and64/
+          cp /tmp/And64InlineHook/And64InlineHook.cpp app/src/main/cpp/and64/
+          sed -i 's/\bregister //g' app/src/main/cpp/and64/And64InlineHook.cpp
+          ls -lh app/src/main/cpp/and64/
+
+      - name: Build single-DEX release APK
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.internal.repository.max.tentatives=6 -Dorg.gradle.internal.repository.initial.backoff=5000"
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.1.10909125"
+          ok=0
+          for i in 1 2 3; do
+            echo "=== Build attempt $i ==="
+            if gradle assembleRelease --stacktrace --refresh-dependencies; then ok=1; break; fi
+            echo "Attempt $i failed — waiting 60s and retrying"
+            gradle --stop || true
+            sleep 60
+          done
+          if [ "$ok" != "1" ]; then echo "All build attempts failed"; exit 1; fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ModMenuPro-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
