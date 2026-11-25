@@ -1,25 +1,16 @@
 // ============================================================
-// native-lib.cpp - BOHA XVIP / ModMenuPro v7
+// native-lib.cpp - BOHA XVIP / ModMenuPro v8 (Strict On-Click Lazy Hooking)
 // ------------------------------------------------------------
-// * Thread-safe SIGSEGV/SIGBUS Fault Shield (ScopedFaultGuard)
-// * Zero-lag cached libil2cpp.so base/range + relaxed atomics
-// * Full Il2Cpp runtime resolution (no hardcoded static RVAs)
-// * All hooks integrated from libdatastore_shared.so analysis:
-//     1. SR-SPOOF   (Device ID Spoofer / Unban)
-//     2. ESP        (Transform & PhysicsActor tracking)
-//     3. Weapon     (SilentAim / WallPen / OnUpdate)
-//     4. Camera     (FOV / UniversalCamera / FreeCam / Spectate)
-//     5. SkyWalk    (CharacterActor / FallState / StateMachine / Head)
-//     6. Health/UI  (ElementHealthSync / HudHealthView / Sliders / Fall)
-//     7. Movement   (PhysicsActor Velocity / WalkOnAir / AutoWalk / NavGraph)
-//     8. Sync/Car   (Clothes / Interp / VehBody / Stamina)
-//     9. World/Range(DayNight / RemoteCollisionCulling 5-system loop)
+// * ZERO background threads, ZERO IL2CPP lookups, ZERO hooks on load
+// * Fetches & installs ONLY the specific hooks for a feature when clicked ON
+// * Thread-safe mutex + duplicate-trampoline guard + SIGSEGV/SIGBUS Fault Shield
 // ============================================================
 
 #include <jni.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
@@ -45,7 +36,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "ModMenu", __VA_ARGS__)
 
 // ============================================================
-// SIGSEGV / SIGBUS FAULT SHIELD (matches SEGV-SHIELD pattern)
+// SIGSEGV / SIGBUS FAULT SHIELD
 // ============================================================
 static thread_local sigjmp_buf t_faultJmp;
 static thread_local volatile sig_atomic_t t_faultGuarded = 0;
@@ -103,7 +94,9 @@ struct PositionComponent { float x, y, z; };
 
 static std::atomic<uintptr_t> g_libBase{0};
 static std::atomic<uintptr_t> g_libEnd{0};
-static std::atomic<bool> g_initStarted{false};
+static std::atomic<bool> g_il2cppReady{false};
+static std::mutex g_il2cppMutex;
+static std::mutex g_hookMutex;
 
 // Spoofed device ID helper (cached hex string)
 static char g_spoofHex[33] = "9a4f2c81d7e04b31a8c502e9f1b63d48";
@@ -508,15 +501,20 @@ static void hook_RangeCull(void* self, const MethodInfo* m) {
 }
 
 // ============================================================
-// SAFE HOOKING ENGINE
+// SAFE HOOKING ENGINE (Duplicate-Protected)
 // ============================================================
 static bool safeHook(Il2CppClass* klass, const char* methodName, int args,
                      void* replaceFn, void** outOrig,
                      uintptr_t libBase, uintptr_t libEnd, const char* label) {
-    F.hooksTotal.fetch_add(1, std::memory_order_relaxed);
     if (!klass || !methodName || !replaceFn || !outOrig || !il2cpp.class_get_method) {
         return false;
     }
+    // Already hooked by another feature group -> skip safely without duplicate trampoline
+    if (*outOrig != nullptr) {
+        return true;
+    }
+
+    F.hooksTotal.fetch_add(1, std::memory_order_relaxed);
 
     const Il2CppMethod* m = nullptr;
     GUARDED_RUN(label, {
@@ -542,7 +540,6 @@ static bool safeHook(Il2CppClass* klass, const char* methodName, int args,
         LOGE("[hook] %s: unaligned ARM64 addr %p", label, ptr);
         return false;
     }
-    // Guard against tiny <=12-byte getter/return stubs that cannot fit a 16-byte trampoline
     const uint32_t* insns = reinterpret_cast<const uint32_t*>(ptr);
     if (insns[0] == 0xd65f03c0u || insns[1] == 0xd65f03c0u || insns[2] == 0xd65f03c0u) {
         LOGI("[hook] %s: '%s' stub <=12B, skipped safely", label, methodName);
@@ -572,6 +569,7 @@ static bool safeHook(Il2CppClass* klass, const char* methodName, int args,
 #endif
 
     F.hooksInstalled.fetch_add(1, std::memory_order_relaxed);
+    F.hooked.store(true, std::memory_order_relaxed);
     LOGI("[hook] %s: hooked '%s' @ %p", label, methodName, ptr);
     return true;
 }
@@ -592,7 +590,7 @@ static bool isSafeModeFilePresent() {
            access("/data/local/tmp/modmenu_safe.txt", F_OK) == 0;
 }
 
-static void* waitForIl2Cpp(int timeoutSeconds = 90) {
+static void* waitForIl2Cpp(int timeoutSeconds = 30) {
     const int attempts = timeoutSeconds * 2;
     for (int i = 0; i < attempts; i++) {
         uintptr_t base = 0, end = 0;
@@ -601,17 +599,17 @@ static void* waitForIl2Cpp(int timeoutSeconds = 90) {
             if (handle) {
                 g_libBase.store(base, std::memory_order_relaxed);
                 g_libEnd.store(end, std::memory_order_relaxed);
-                LOGI("[init] libil2cpp.so mapped 0x%" PRIxPTR "-0x%" PRIxPTR, base, end);
+                LOGI("[lazy-init] libil2cpp.so mapped 0x%" PRIxPTR "-0x%" PRIxPTR, base, end);
                 return handle;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    LOGE("[init] libil2cpp.so timeout after %ds", timeoutSeconds);
+    LOGE("[lazy-init] libil2cpp.so timeout after %ds", timeoutSeconds);
     return nullptr;
 }
 
-static Il2CppDomain* waitForDomain(int timeoutSeconds = 30) {
+static Il2CppDomain* waitForDomain(int timeoutSeconds = 15) {
     if (!il2cpp.domain_get) return nullptr;
     for (int i = 0; i < timeoutSeconds * 2; i++) {
         Il2CppDomain* d = nullptr;
@@ -622,7 +620,6 @@ static Il2CppDomain* waitForDomain(int timeoutSeconds = 30) {
     return nullptr;
 }
 
-// Lookup helper trying fullName first, then bare class name across all assemblies
 static Il2CppClass* findClassSafe(Il2CppDomain* domain, const char* fullName) {
     if (!domain || !fullName) return nullptr;
     Il2CppClass* k = nullptr;
@@ -632,171 +629,334 @@ static Il2CppClass* findClassSafe(Il2CppDomain* domain, const char* fullName) {
     return k;
 }
 
-static void installAllHooks(Il2CppDomain* domain, uintptr_t libBase, uintptr_t libEnd) {
-    // --- 0. Fallback generic Position / Health ---
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.UnityViewFeature.Components.Position")) {
-        const char* cands[] = {"Update", "OnUpdate", "Execute", "UpdatePosition", "SetPosition"};
-        for (const char* m : cands) {
-            if (safeHook(k, m, -1, (void*)hook_PositionUpdate, (void**)&orig_PositionUpdate, libBase, libEnd, "Position")) break;
+// Called ONLY on first user click that requires hooks
+static bool ensureIl2CppReady() {
+    if (g_il2cppReady.load(std::memory_order_acquire)) {
+        if (il2cpp.thread_attach && il2cpp.domain_get) {
+            if (auto* d = il2cpp.domain_get()) {
+                GUARDED_RUN("thread_attach", { il2cpp.thread_attach(d); });
+            }
         }
-    }
-    if (auto* k = findClassSafe(domain, "Health")) {
-        safeHook(k, "TakeDamage", 1, (void*)hook_TakeDamage, (void**)&orig_TakeDamage, libBase, libEnd, "Health.TakeDamage");
+        return true;
     }
 
-    // --- 1. SR-SPOOF (installed lazily on demand when Device ID Spoof is enabled) ---
-
-    // --- 2. ESP / Transform / Physics ---
-    if (auto* k = findClassSafe(domain, "UnityEngine.Transform")) {
-        safeHook(k, "set_position", 1, (void*)hook_TransformSetPos, (void**)&orig_TransformSetPos, libBase, libEnd, "Transform.set_position");
-        safeHook(k, "set_localPosition", 1, (void*)hook_TransformSetLocalPos, (void**)&orig_TransformSetLocalPos, libBase, libEnd, "Transform.set_localPosition");
-        safeHook(k, "SetPositionAndRotation", 2, (void*)hook_TransformSetPosRot, (void**)&orig_TransformSetPosRot, libBase, libEnd, "Transform.SetPositionAndRotation");
-    }
-    if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActor")) {
-        safeHook(k, "Update", 0, (void*)hook_PhysicsActorUpdate, (void**)&orig_PhysicsActorUpdate, libBase, libEnd, "PhysicsActor.Update");
-        safeHook(k, "get_Velocity", 0, (void*)hook_GetVelocity, (void**)&orig_GetVelocity, libBase, libEnd, "PhysicsActor.get_Velocity");
-        safeHook(k, "FixedUpdate", 0, (void*)hook_PhysicsFixed, (void**)&orig_PhysicsFixed, libBase, libEnd, "PhysicsActor.FixedUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActorSync")) {
-        safeHook(k, "FixedUpdate", 0, (void*)hook_PhysicsSyncFixed, (void**)&orig_PhysicsSyncFixed, libBase, libEnd, "PhysicsActorSync.FixedUpdate");
-    }
-
-    // --- 3. Weapon / SilentAim / WallPen ---
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Systems.WeaponProduceAttackRangedSystem")) {
-        safeHook(k, "RayCastAttackRanged", 7, (void*)hook_RayCast7, (void**)&orig_RayCast7, libBase, libEnd, "RayCastAttackRanged.7");
-        safeHook(k, "RayCastAttackRanged", 8, (void*)hook_RayCast8, (void**)&orig_RayCast8, libBase, libEnd, "RayCastAttackRanged.8");
-        safeHook(k, "OnUpdate", -1, (void*)hook_WeaponOnUpdate, (void**)&orig_WeaponOnUpdate, libBase, libEnd, "WeaponSystem.OnUpdate");
-        safeHook(k, "ProcessHits", 6, (void*)hook_ProcessHits6, (void**)&orig_ProcessHits6, libBase, libEnd, "Weapon.ProcessHits");
-        safeHook(k, "GetPenetrationParameters", -1, (void*)hook_WallPenParams, (void**)&orig_WallPenParams, libBase, libEnd, "WallPen.GetPenParams");
-        safeHook(k, "TryGetPenetrationDistance", -1, (void*)hook_WallPenDist, (void**)&orig_WallPenDist, libBase, libEnd, "WallPen.TryGetPenDist");
-    }
-
-    // --- 4. Camera / FOV / FreeCam / Spectate ---
-    if (auto* k = findClassSafe(domain, "UnityEngine.Camera")) {
-        safeHook(k, "set_fieldOfView", 1, (void*)hook_CameraSetFov, (void**)&orig_CameraSetFov, libBase, libEnd, "Camera.set_fieldOfView");
-        safeHook(k, "get_fieldOfView", 0, (void*)hook_CameraGetFov, (void**)&orig_CameraGetFov, libBase, libEnd, "Camera.get_fieldOfView");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.Universal.UniversalCameraSystem")) {
-        safeHook(k, "ApplyInputWithVerticalRotationLimit", 2, (void*)hook_UnivCamRot, (void**)&orig_UnivCamRot, libBase, libEnd, "UniversalCameraSystem");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraFollowingPedSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_CamFollowPed, (void**)&orig_CamFollowPed, libBase, libEnd, "FreeCam.Ped");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraFollowingVehicleSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_CamFollowVeh, (void**)&orig_CamFollowVeh, libBase, libEnd, "FreeCam.Veh");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraPlacementSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_CamPlacement, (void**)&orig_CamPlacement, libBase, libEnd, "FreeCam.Placement");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.SoundFmodFeature.Services.SoundFmodPriorityService")) {
-        safeHook(k, "SwitchListener", 1, (void*)hook_SwitchListener, (void**)&orig_SwitchListener, libBase, libEnd, "SoundFmod.SwitchListener");
-    }
-
-    // --- 5. SkyWalk / GodMode / FallDamage / Head ---
-    if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.CharacterActor")) {
-        safeHook(k, "Update", 0, (void*)hook_CharActorUpdate, (void**)&orig_CharActorUpdate, libBase, libEnd, "SkyWalk.Update");
-        safeHook(k, "PostSimulationUpdate", 1, (void*)hook_CharActorPostSim, (void**)&orig_CharActorPostSim, libBase, libEnd, "SkyWalk.PostSim");
-        safeHook(k, "PreSimulationUpdate", 1, (void*)hook_CharActorPreSim, (void**)&orig_CharActorPreSim, libBase, libEnd, "SkyWalk.PreSim");
-        safeHook(k, "get_IsStable", 0, (void*)hook_CharIsStable, (void**)&orig_CharIsStable, libBase, libEnd, "SkyWalk.IsStable");
-        safeHook(k, "get_IsGrounded", 0, (void*)hook_CharIsGrounded, (void**)&orig_CharIsGrounded, libBase, libEnd, "SkyWalk.ActorIsGrounded");
-        safeHook(k, "ForceNotGrounded", 0, (void*)hook_CharForceNotGround, (void**)&orig_CharForceNotGround, libBase, libEnd, "SkyWalk.ForceNotGrounded");
-        safeHook(k, "LateUpdate", 0, (void*)hook_CharActorLateUpdate, (void**)&orig_CharActorLateUpdate, libBase, libEnd, "CharActor.LateUpdate(head)");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.DataContainers.PedKnockoutParameters")) {
-        if (!safeHook(k, "GetFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage")) {
-            safeHook(k, "CalculateFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage");
+    std::lock_guard<std::mutex> lock(g_il2cppMutex);
+    if (g_il2cppReady.load(std::memory_order_acquire)) {
+        if (il2cpp.thread_attach && il2cpp.domain_get) {
+            if (auto* d = il2cpp.domain_get()) {
+                GUARDED_RUN("thread_attach", { il2cpp.thread_attach(d); });
+            }
         }
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Fall.FallState")) {
-        safeHook(k, "CanEnterState", 1, (void*)hook_FallStateCanEnter, (void**)&orig_FallStateCanEnter, libBase, libEnd, "SkyWalk.FallState");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.PedStateMachine")) {
-        safeHook(k, "ForceExit", 1, (void*)hook_StateForceExit, (void**)&orig_StateForceExit, libBase, libEnd, "SkyWalk.ForceExit");
-        safeHook(k, "TryEnter", 1, (void*)hook_StateTryEnter, (void**)&orig_StateTryEnter, libBase, libEnd, "SkyWalk.TryEnter");
-        safeHook(k, "ForceEnter", 1, (void*)hook_StateForceEnter, (void**)&orig_StateForceEnter, libBase, libEnd, "GodMode.ForceEnter");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Weapon.WeaponRangeShootState")) {
-        safeHook(k, "CanEnterState", 1, (void*)hook_WeaponShootCanEnter, (void**)&orig_WeaponShootCanEnter, libBase, libEnd, "SkyWalk.WeaponShoot");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.PedState")) {
-        safeHook(k, "CanEnterState", 1, (void*)hook_PedStateCanEnter, (void**)&orig_PedStateCanEnter, libBase, libEnd, "SkyWalk.PedState");
+        return true;
     }
 
-    // --- 6. Health / HUD Sliders / FallDamage ---
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.ElementsFeature.Systems.ElementHealthSyncSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_ElemHealthSync, (void**)&orig_ElemHealthSync, libBase, libEnd, "ElementHealthSync.OnUpdate");
-    } else if (auto* k2 = findClassSafe(domain, "ElementHealthSyncSystem")) {
-        safeHook(k2, "OnUpdate", -1, (void*)hook_ElemHealthSync, (void**)&orig_ElemHealthSync, libBase, libEnd, "ElementHealthSync.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "UpdateHudHealthViewSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_HudHealthView, (void**)&orig_HudHealthView, libBase, libEnd, "HudHealthView.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "UnityEngine.UI.Slider")) {
-        safeHook(k, "set_value", 1, (void*)hook_SliderSetVal, (void**)&orig_SliderSetVal, libBase, libEnd, "Slider.set_value");
-        safeHook(k, "SetValueWithoutNotify", 1, (void*)hook_SliderSetSilent, (void**)&orig_SliderSetSilent, libBase, libEnd, "Slider.SetSilent");
-    }
-    if (auto* k = findClassSafe(domain, "PedViewKnockoutService")) {
-        safeHook(k, "ApplyLocalFallDamage", 1, (void*)hook_ApplyLocalFall, (void**)&orig_ApplyLocalFall, libBase, libEnd, "FallDamage.Apply");
+    if (isSafeModeFilePresent()) {
+        F.safeMode.store(true, std::memory_order_relaxed);
+        LOGI("[SR-SAFE] Safe mode file detected - hooks skipped");
+        return false;
     }
 
-    // --- 7. AutoWalk / NavigationGraph ---
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.Systems.PedViewInputsSystem")) {
-        if (!safeHook(k, "update", -1, (void*)hook_PedViewInputs, (void**)&orig_PedViewInputs, libBase, libEnd, "PedViewInputsSystem.update")) {
-            safeHook(k, "OnUpdate", -1, (void*)hook_PedViewInputs, (void**)&orig_PedViewInputs, libBase, libEnd, "PedViewInputsSystem.OnUpdate");
+    void* handle = waitForIl2Cpp();
+    if (!handle) return false;
+
+    if (!il2cpp.init(handle)) {
+        LOGE("[lazy-init] il2cpp.init FAILED");
+        return false;
+    }
+
+    Il2CppDomain* domain = waitForDomain();
+    if (!domain) return false;
+
+    if (il2cpp.thread_attach) {
+        GUARDED_RUN("thread_attach", {
+            il2cpp.thread_attach(domain);
+        });
+    }
+
+    g_il2cppReady.store(true, std::memory_order_release);
+    LOGI("[lazy-init] IL2CPP initialized on user click");
+    return true;
+}
+
+// ============================================================
+// PER-FEATURE ON-CLICK HOOK GROUPS
+// ============================================================
+enum HookGroup : int {
+    GROUP_ESP = 0,
+    GROUP_WEAPON,
+    GROUP_CAMERA,
+    GROUP_CHAR_MOVE,
+    GROUP_HEALTH,
+    GROUP_POS_NAV,
+    GROUP_VEH_STAMINA,
+    GROUP_WORLD_RANGE,
+    GROUP_SPOOF,
+    GROUP_COUNT
+};
+
+static std::atomic<bool> g_groupDone[GROUP_COUNT]{};
+
+static void installGroupHooks(HookGroup group) {
+    if (group < 0 || group >= GROUP_COUNT) return;
+    if (g_groupDone[group].load(std::memory_order_acquire)) return;
+
+    if (!ensureIl2CppReady()) return;
+
+    std::lock_guard<std::mutex> lock(g_hookMutex);
+    if (g_groupDone[group].load(std::memory_order_acquire)) return;
+
+    Il2CppDomain* domain = il2cpp.domain_get ? il2cpp.domain_get() : nullptr;
+    uintptr_t libBase = g_libBase.load(std::memory_order_relaxed);
+    uintptr_t libEnd  = g_libEnd.load(std::memory_order_relaxed);
+    if (!domain || !libBase || !libEnd) return;
+
+    switch (group) {
+        case GROUP_ESP: {
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.UnityViewFeature.Components.Position")) {
+                const char* cands[] = {"Update", "OnUpdate", "Execute", "UpdatePosition", "SetPosition"};
+                for (const char* m : cands) {
+                    if (safeHook(k, m, -1, (void*)hook_PositionUpdate, (void**)&orig_PositionUpdate, libBase, libEnd, "Position")) break;
+                }
+            }
+            if (auto* k = findClassSafe(domain, "UnityEngine.Transform")) {
+                safeHook(k, "set_position", 1, (void*)hook_TransformSetPos, (void**)&orig_TransformSetPos, libBase, libEnd, "Transform.set_position");
+                safeHook(k, "set_localPosition", 1, (void*)hook_TransformSetLocalPos, (void**)&orig_TransformSetLocalPos, libBase, libEnd, "Transform.set_localPosition");
+                safeHook(k, "SetPositionAndRotation", 2, (void*)hook_TransformSetPosRot, (void**)&orig_TransformSetPosRot, libBase, libEnd, "Transform.SetPositionAndRotation");
+            }
+            if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActor")) {
+                safeHook(k, "Update", 0, (void*)hook_PhysicsActorUpdate, (void**)&orig_PhysicsActorUpdate, libBase, libEnd, "PhysicsActor.Update");
+                safeHook(k, "FixedUpdate", 0, (void*)hook_PhysicsFixed, (void**)&orig_PhysicsFixed, libBase, libEnd, "PhysicsActor.FixedUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActorSync")) {
+                safeHook(k, "FixedUpdate", 0, (void*)hook_PhysicsSyncFixed, (void**)&orig_PhysicsSyncFixed, libBase, libEnd, "PhysicsActorSync.FixedUpdate");
+            }
+            break;
         }
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.Map.NavigationGraph")) {
-        safeHook(k, "FindPath", 3, (void*)hook_NavFindPath, (void**)&orig_NavFindPath, libBase, libEnd, "NavGraph.FindPath");
-        safeHook(k, ".ctor", -1, (void*)hook_NavCtor, (void**)&orig_NavCtor, libBase, libEnd, "NavGraph.ctor");
-        safeHook(k, "SetGoal", 1, (void*)hook_NavSetGoal, (void**)&orig_NavSetGoal, libBase, libEnd, "NavGraph.SetGoal");
-        safeHook(k, "SetWaypoint", 1, (void*)hook_NavSetWaypoint, (void**)&orig_NavSetWaypoint, libBase, libEnd, "NavGraph.SetWaypoint");
-        safeHook(k, "SetDestination", 1, (void*)hook_NavSetDest, (void**)&orig_NavSetDest, libBase, libEnd, "NavGraph.SetDestination");
-        safeHook(k, "AddMarker", 1, (void*)hook_NavAddMarker, (void**)&orig_NavAddMarker, libBase, libEnd, "NavGraph.AddMarker");
-    }
 
-    // --- 8. CLSV-HOOKS & CarFeatures ---
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedsFeature.Systems.Streaming.PedLoadClothesSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_PedLoadClothes, (void**)&orig_PedLoadClothes, libBase, libEnd, "PedLoadClothes.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Systems.ProxySystems.GeneralElementInterpolateTransformSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_InterpTransform, (void**)&orig_InterpTransform, libBase, libEnd, "Interp.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.VehicleViewFeature.Systems.VehicleBody.VehicleBodyPrePhysicsSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_VehBodyPrePhys, (void**)&orig_VehBodyPrePhys, libBase, libEnd, "VehBody.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "PedChangeClothesSyncSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_PedClothesSync, (void**)&orig_PedClothesSync, libBase, libEnd, "PedClothesSync.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "ElementModelSyncSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_ElemModelSync, (void**)&orig_ElemModelSync, libBase, libEnd, "ElementModelSync.OnUpdate");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.Systems.PedViewStorage")) {
-        safeHook(k, "SetStaminaLose", 1, (void*)hook_SetStaminaLose, (void**)&orig_SetStaminaLose, libBase, libEnd, "CarFeatures.SetStaminaLose");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedsFeature.Systems.PedValues.PedStaminaSystem")) {
-        safeHook(k, "OnUpdate", -1, (void*)hook_PedStaminaSystem, (void**)&orig_PedStaminaSystem, libBase, libEnd, "CarFeatures.PedStamina");
-    }
-
-    // --- 9. DAYNIGHT & SR-RANGE ---
-    if (auto* k = findClassSafe(domain, "SkyLightingDriver")) {
-        safeHook(k, "LateUpdate", 0, (void*)hook_SkyDriverLate, (void**)&orig_SkyDriverLate, libBase, libEnd, "SkyDriver.LateUpdate");
-    }
-    const char* rangeClasses[5] = {
-        "RemoteCollisionCullingSystem",
-        "RemoteCollisionCullingRestoreSystem",
-        "PedViewInVehicleVisibilityDistanceSystem",
-        "PedViewVisibilityUpdateSystem",
-        "VehiclesDistanceCheckSystem"
-    };
-    void* rangeFns[5] = {
-        (void*)hook_RangeCull<0>, (void*)hook_RangeCull<1>,
-        (void*)hook_RangeCull<2>, (void*)hook_RangeCull<3>,
-        (void*)hook_RangeCull<4>
-    };
-    for (int i = 0; i < 5; i++) {
-        if (auto* k = findClassSafe(domain, rangeClasses[i])) {
-            safeHook(k, "OnUpdate", -1, rangeFns[i], (void**)&orig_RangeCull[i], libBase, libEnd, rangeClasses[i]);
+        case GROUP_WEAPON: {
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Systems.WeaponProduceAttackRangedSystem")) {
+                safeHook(k, "RayCastAttackRanged", 7, (void*)hook_RayCast7, (void**)&orig_RayCast7, libBase, libEnd, "RayCastAttackRanged.7");
+                safeHook(k, "RayCastAttackRanged", 8, (void*)hook_RayCast8, (void**)&orig_RayCast8, libBase, libEnd, "RayCastAttackRanged.8");
+                safeHook(k, "OnUpdate", -1, (void*)hook_WeaponOnUpdate, (void**)&orig_WeaponOnUpdate, libBase, libEnd, "WeaponSystem.OnUpdate");
+                safeHook(k, "ProcessHits", 6, (void*)hook_ProcessHits6, (void**)&orig_ProcessHits6, libBase, libEnd, "Weapon.ProcessHits");
+                safeHook(k, "GetPenetrationParameters", -1, (void*)hook_WallPenParams, (void**)&orig_WallPenParams, libBase, libEnd, "WallPen.GetPenParams");
+                safeHook(k, "TryGetPenetrationDistance", -1, (void*)hook_WallPenDist, (void**)&orig_WallPenDist, libBase, libEnd, "WallPen.TryGetPenDist");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Weapon.WeaponRangeShootState")) {
+                safeHook(k, "CanEnterState", 1, (void*)hook_WeaponShootCanEnter, (void**)&orig_WeaponShootCanEnter, libBase, libEnd, "SkyWalk.WeaponShoot");
+            }
+            break;
         }
+
+        case GROUP_CAMERA: {
+            if (auto* k = findClassSafe(domain, "UnityEngine.Camera")) {
+                safeHook(k, "set_fieldOfView", 1, (void*)hook_CameraSetFov, (void**)&orig_CameraSetFov, libBase, libEnd, "Camera.set_fieldOfView");
+                safeHook(k, "get_fieldOfView", 0, (void*)hook_CameraGetFov, (void**)&orig_CameraGetFov, libBase, libEnd, "Camera.get_fieldOfView");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.Universal.UniversalCameraSystem")) {
+                safeHook(k, "ApplyInputWithVerticalRotationLimit", 2, (void*)hook_UnivCamRot, (void**)&orig_UnivCamRot, libBase, libEnd, "UniversalCameraSystem");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraFollowingPedSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_CamFollowPed, (void**)&orig_CamFollowPed, libBase, libEnd, "FreeCam.Ped");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraFollowingVehicleSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_CamFollowVeh, (void**)&orig_CamFollowVeh, libBase, libEnd, "FreeCam.Veh");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.MainCameraFeature.Systems.CameraPlacementSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_CamPlacement, (void**)&orig_CamPlacement, libBase, libEnd, "FreeCam.Placement");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.SoundFmodFeature.Services.SoundFmodPriorityService")) {
+                safeHook(k, "SwitchListener", 1, (void*)hook_SwitchListener, (void**)&orig_SwitchListener, libBase, libEnd, "SoundFmod.SwitchListener");
+            }
+            break;
+        }
+
+        case GROUP_CHAR_MOVE: {
+            if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActor")) {
+                safeHook(k, "get_Velocity", 0, (void*)hook_GetVelocity, (void**)&orig_GetVelocity, libBase, libEnd, "PhysicsActor.get_Velocity");
+            }
+            if (auto* k = findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.CharacterActor")) {
+                safeHook(k, "Update", 0, (void*)hook_CharActorUpdate, (void**)&orig_CharActorUpdate, libBase, libEnd, "SkyWalk.Update");
+                safeHook(k, "PostSimulationUpdate", 1, (void*)hook_CharActorPostSim, (void**)&orig_CharActorPostSim, libBase, libEnd, "SkyWalk.PostSim");
+                safeHook(k, "PreSimulationUpdate", 1, (void*)hook_CharActorPreSim, (void**)&orig_CharActorPreSim, libBase, libEnd, "SkyWalk.PreSim");
+                safeHook(k, "get_IsStable", 0, (void*)hook_CharIsStable, (void**)&orig_CharIsStable, libBase, libEnd, "SkyWalk.IsStable");
+                safeHook(k, "get_IsGrounded", 0, (void*)hook_CharIsGrounded, (void**)&orig_CharIsGrounded, libBase, libEnd, "SkyWalk.ActorIsGrounded");
+                safeHook(k, "ForceNotGrounded", 0, (void*)hook_CharForceNotGround, (void**)&orig_CharForceNotGround, libBase, libEnd, "SkyWalk.ForceNotGrounded");
+                safeHook(k, "LateUpdate", 0, (void*)hook_CharActorLateUpdate, (void**)&orig_CharActorLateUpdate, libBase, libEnd, "CharActor.LateUpdate(head)");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.DataContainers.PedKnockoutParameters")) {
+                if (!safeHook(k, "GetFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage")) {
+                    safeHook(k, "CalculateFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage");
+                }
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Fall.FallState")) {
+                safeHook(k, "CanEnterState", 1, (void*)hook_FallStateCanEnter, (void**)&orig_FallStateCanEnter, libBase, libEnd, "SkyWalk.FallState");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.PedStateMachine")) {
+                safeHook(k, "ForceExit", 1, (void*)hook_StateForceExit, (void**)&orig_StateForceExit, libBase, libEnd, "SkyWalk.ForceExit");
+                safeHook(k, "TryEnter", 1, (void*)hook_StateTryEnter, (void**)&orig_StateTryEnter, libBase, libEnd, "SkyWalk.TryEnter");
+                safeHook(k, "ForceEnter", 1, (void*)hook_StateForceEnter, (void**)&orig_StateForceEnter, libBase, libEnd, "GodMode.ForceEnter");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Weapon.WeaponRangeShootState")) {
+                safeHook(k, "CanEnterState", 1, (void*)hook_WeaponShootCanEnter, (void**)&orig_WeaponShootCanEnter, libBase, libEnd, "SkyWalk.WeaponShoot");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.PedState")) {
+                safeHook(k, "CanEnterState", 1, (void*)hook_PedStateCanEnter, (void**)&orig_PedStateCanEnter, libBase, libEnd, "SkyWalk.PedState");
+            }
+            break;
+        }
+
+        case GROUP_HEALTH: {
+            if (auto* k = findClassSafe(domain, "Health")) {
+                safeHook(k, "TakeDamage", 1, (void*)hook_TakeDamage, (void**)&orig_TakeDamage, libBase, libEnd, "Health.TakeDamage");
+            }
+            if (auto* k = findClassSafe(domain, "PedViewKnockoutService")) {
+                safeHook(k, "ApplyLocalFallDamage", 1, (void*)hook_ApplyLocalFall, (void**)&orig_ApplyLocalFall, libBase, libEnd, "FallDamage.Apply");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.DataContainers.PedKnockoutParameters")) {
+                if (!safeHook(k, "GetFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage")) {
+                    safeHook(k, "CalculateFallDamage", 1, (void*)hook_KnockoutFallDamage, (void**)&orig_KnockoutFallDamage, libBase, libEnd, "SkyWalk.FallDamage");
+                }
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Fall.FallState")) {
+                safeHook(k, "CanEnterState", 1, (void*)hook_FallStateCanEnter, (void**)&orig_FallStateCanEnter, libBase, libEnd, "SkyWalk.FallState");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.PedStateMachine")) {
+                safeHook(k, "ForceEnter", 1, (void*)hook_StateForceEnter, (void**)&orig_StateForceEnter, libBase, libEnd, "GodMode.ForceEnter");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.ElementsFeature.Systems.ElementHealthSyncSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_ElemHealthSync, (void**)&orig_ElemHealthSync, libBase, libEnd, "ElementHealthSync.OnUpdate");
+            } else if (auto* k2 = findClassSafe(domain, "ElementHealthSyncSystem")) {
+                safeHook(k2, "OnUpdate", -1, (void*)hook_ElemHealthSync, (void**)&orig_ElemHealthSync, libBase, libEnd, "ElementHealthSync.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "UpdateHudHealthViewSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_HudHealthView, (void**)&orig_HudHealthView, libBase, libEnd, "HudHealthView.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "UnityEngine.UI.Slider")) {
+                safeHook(k, "set_value", 1, (void*)hook_SliderSetVal, (void**)&orig_SliderSetVal, libBase, libEnd, "Slider.set_value");
+                safeHook(k, "SetValueWithoutNotify", 1, (void*)hook_SliderSetSilent, (void**)&orig_SliderSetSilent, libBase, libEnd, "Slider.SetSilent");
+            }
+            break;
+        }
+
+        case GROUP_POS_NAV: {
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.UnityViewFeature.Components.Position")) {
+                const char* cands[] = {"Update", "OnUpdate", "Execute", "UpdatePosition", "SetPosition"};
+                for (const char* m : cands) {
+                    if (safeHook(k, m, -1, (void*)hook_PositionUpdate, (void**)&orig_PositionUpdate, libBase, libEnd, "Position")) break;
+                }
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.Systems.PedViewInputsSystem")) {
+                if (!safeHook(k, "update", -1, (void*)hook_PedViewInputs, (void**)&orig_PedViewInputs, libBase, libEnd, "PedViewInputsSystem.update")) {
+                    safeHook(k, "OnUpdate", -1, (void*)hook_PedViewInputs, (void**)&orig_PedViewInputs, libBase, libEnd, "PedViewInputsSystem.OnUpdate");
+                }
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.Map.NavigationGraph")) {
+                safeHook(k, "FindPath", 3, (void*)hook_NavFindPath, (void**)&orig_NavFindPath, libBase, libEnd, "NavGraph.FindPath");
+                safeHook(k, ".ctor", -1, (void*)hook_NavCtor, (void**)&orig_NavCtor, libBase, libEnd, "NavGraph.ctor");
+                safeHook(k, "SetGoal", 1, (void*)hook_NavSetGoal, (void**)&orig_NavSetGoal, libBase, libEnd, "NavGraph.SetGoal");
+                safeHook(k, "SetWaypoint", 1, (void*)hook_NavSetWaypoint, (void**)&orig_NavSetWaypoint, libBase, libEnd, "NavGraph.SetWaypoint");
+                safeHook(k, "SetDestination", 1, (void*)hook_NavSetDest, (void**)&orig_NavSetDest, libBase, libEnd, "NavGraph.SetDestination");
+                safeHook(k, "AddMarker", 1, (void*)hook_NavAddMarker, (void**)&orig_NavAddMarker, libBase, libEnd, "NavGraph.AddMarker");
+            }
+            break;
+        }
+
+        case GROUP_VEH_STAMINA: {
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.Systems.PedViewStorage")) {
+                safeHook(k, "SetStaminaLose", 1, (void*)hook_SetStaminaLose, (void**)&orig_SetStaminaLose, libBase, libEnd, "CarFeatures.SetStaminaLose");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedsFeature.Systems.PedValues.PedStaminaSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_PedStaminaSystem, (void**)&orig_PedStaminaSystem, libBase, libEnd, "CarFeatures.PedStamina");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.VehicleViewFeature.Systems.VehicleBody.VehicleBodyPrePhysicsSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_VehBodyPrePhys, (void**)&orig_VehBodyPrePhys, libBase, libEnd, "VehBody.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Systems.ProxySystems.GeneralElementInterpolateTransformSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_InterpTransform, (void**)&orig_InterpTransform, libBase, libEnd, "Interp.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.PedsFeature.Systems.Streaming.PedLoadClothesSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_PedLoadClothes, (void**)&orig_PedLoadClothes, libBase, libEnd, "PedLoadClothes.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "PedChangeClothesSyncSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_PedClothesSync, (void**)&orig_PedClothesSync, libBase, libEnd, "PedClothesSync.OnUpdate");
+            }
+            if (auto* k = findClassSafe(domain, "ElementModelSyncSystem")) {
+                safeHook(k, "OnUpdate", -1, (void*)hook_ElemModelSync, (void**)&orig_ElemModelSync, libBase, libEnd, "ElementModelSync.OnUpdate");
+            }
+            break;
+        }
+
+        case GROUP_WORLD_RANGE: {
+            if (auto* k = findClassSafe(domain, "SkyLightingDriver")) {
+                safeHook(k, "LateUpdate", 0, (void*)hook_SkyDriverLate, (void**)&orig_SkyDriverLate, libBase, libEnd, "SkyDriver.LateUpdate");
+            }
+            const char* rangeClasses[5] = {
+                "RemoteCollisionCullingSystem",
+                "RemoteCollisionCullingRestoreSystem",
+                "PedViewInVehicleVisibilityDistanceSystem",
+                "PedViewVisibilityUpdateSystem",
+                "VehiclesDistanceCheckSystem"
+            };
+            void* rangeFns[5] = {
+                (void*)hook_RangeCull<0>, (void*)hook_RangeCull<1>,
+                (void*)hook_RangeCull<2>, (void*)hook_RangeCull<3>,
+                (void*)hook_RangeCull<4>
+            };
+            for (int i = 0; i < 5; i++) {
+                if (auto* k = findClassSafe(domain, rangeClasses[i])) {
+                    safeHook(k, "OnUpdate", -1, rangeFns[i], (void**)&orig_RangeCull[i], libBase, libEnd, rangeClasses[i]);
+                }
+            }
+            break;
+        }
+
+        case GROUP_SPOOF: {
+            if (auto* k = findClassSafe(domain, "UnityEngine.SystemInfo")) {
+                safeHook(k, "get_deviceUniqueIdentifier", 0, (void*)hook_GetDeviceUniqueId, (void**)&orig_GetDeviceUniqueId, libBase, libEnd, "SystemInfo.DeviceId");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.GameScripts.Authorization.SpecificWindows.AuthorizationMetaModel")) {
+                g_offExtReal = safeFieldOffset(k, "ExtendedDeviceIdReal");
+                g_offExtGen  = safeFieldOffset(k, "ExtendedDeviceIdGenerated");
+                g_offAdvId   = safeFieldOffset(k, "AdvertisingId");
+                const Il2CppMethod* fm = nullptr;
+                GUARDED_RUN("Auth.FromDevice.probe", {
+                    fm = il2cpp.class_get_method(k, "FromDevice", -1);
+                });
+                uint32_t pcnt = (fm && il2cpp.method_get_param_count) ? il2cpp.method_get_param_count(fm) : 99;
+                if (pcnt <= 2) {
+                    safeHook(k, "FromDevice", static_cast<int>(pcnt), (void*)hook_AuthFromDevice, (void**)&orig_AuthFromDevice, libBase, libEnd, "Auth.FromDevice");
+                } else {
+                    LOGI("[hook] Auth.FromDevice: paramCount=%u skipped for ABI safety", pcnt);
+                }
+                safeHook(k, "FillSelfExtended", 0, (void*)hook_AuthFillExtended, (void**)&orig_AuthFillExtended, libBase, libEnd, "Auth.FillSelfExtended");
+            }
+            if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.SettingsFeature.Systems.SettingsServiceSystem")) {
+                safeHook(k, "GetDeviceId", 0, (void*)hook_SettingsGetDeviceId, (void**)&orig_SettingsGetDevId, libBase, libEnd, "Settings.GetDeviceId");
+            }
+            F.spoofHooksInstalled.store(true, std::memory_order_relaxed);
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    g_groupDone[group].store(true, std::memory_order_release);
+    LOGI("[on-click] group %d ready (installed=%d / total=%d)",
+         static_cast<int>(group), F.hooksInstalled.load(), F.hooksTotal.load());
+}
+
+// Spawns a one-shot worker ONLY when user clicks a feature ON (exits immediately after hooking)
+static void triggerGroupOnClick(HookGroup group) {
+    if (group < 0 || group >= GROUP_COUNT) return;
+    if (g_groupDone[group].load(std::memory_order_acquire)) return;
+    try {
+        std::thread([group]() {
+            installGroupHooks(group);
+        }).detach();
+    } catch (...) {
+        LOGE("[on-click] failed to spawn hook worker for group %d", static_cast<int>(group));
     }
 }
 
@@ -808,177 +968,53 @@ namespace Offsets {
     constexpr uintptr_t CameraFov    = 0x0;
 }
 
-static bool installHooksSafely() {
-    try {
-        if (isSafeModeFilePresent()) {
-            F.safeMode.store(true, std::memory_order_relaxed);
-            LOGI("[SR-SAFE] Safe mode file detected - hooks skipped");
-            return false;
-        }
-
-        void* handle = waitForIl2Cpp();
-        if (!handle) return false;
-
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-
-        if (!il2cpp.init(handle)) {
-            LOGE("[init] il2cpp.init FAILED");
-            return false;
-        }
-
-        Il2CppDomain* domain = waitForDomain();
-        if (!domain) return false;
-
-        if (il2cpp.thread_attach) {
-            GUARDED_RUN("thread_attach", {
-                il2cpp.thread_attach(domain);
-            });
-        }
-
-        // Wait briefly for main game assemblies to finish registering
-        for (int i = 0; i < 20; i++) {
-            if (findClassSafe(domain, "Lightbug.CharacterControllerPro.Core.PhysicsActor") ||
-                findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.UnityViewFeature.Components.Position")) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-
-        uintptr_t base = g_libBase.load(std::memory_order_relaxed);
-        uintptr_t end  = g_libEnd.load(std::memory_order_relaxed);
-        installAllHooks(domain, base, end);
-
-        bool ok = F.hooksInstalled.load(std::memory_order_relaxed) > 0;
-        F.hooked.store(ok, std::memory_order_relaxed);
-        LOGI("[init] hooks installed: %d / %d (faults=%d)",
-             F.hooksInstalled.load(), F.hooksTotal.load(), F.faultsRecovered.load());
-        return ok;
-    } catch (...) {
-        LOGE("[init] exception during hook install");
-        return false;
-    }
-}
-
-static void installSpoofHooksIfNeeded(uintptr_t libBase, uintptr_t libEnd) {
-    if (F.spoofHooksInstalled.load(std::memory_order_relaxed) ||
-        !F.deviceSpoof.load(std::memory_order_relaxed) ||
-        !F.hooked.load(std::memory_order_relaxed) ||
-        !il2cpp.ok || !libBase || !libEnd) {
-        return;
-    }
-    bool expected = false;
-    if (!F.spoofHooksInstalled.compare_exchange_strong(expected, true)) return;
-
-    Il2CppDomain* domain = il2cpp.domain_get ? il2cpp.domain_get() : nullptr;
-    if (!domain) {
-        F.spoofHooksInstalled.store(false, std::memory_order_relaxed);
-        return;
-    }
-    if (auto* k = findClassSafe(domain, "UnityEngine.SystemInfo")) {
-        safeHook(k, "get_deviceUniqueIdentifier", 0, (void*)hook_GetDeviceUniqueId, (void**)&orig_GetDeviceUniqueId, libBase, libEnd, "SystemInfo.DeviceId");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.GameScripts.Authorization.SpecificWindows.AuthorizationMetaModel")) {
-        g_offExtReal = safeFieldOffset(k, "ExtendedDeviceIdReal");
-        g_offExtGen  = safeFieldOffset(k, "ExtendedDeviceIdGenerated");
-        g_offAdvId   = safeFieldOffset(k, "AdvertisingId");
-        const Il2CppMethod* fm = nullptr;
-        GUARDED_RUN("Auth.FromDevice.probe", {
-            fm = il2cpp.class_get_method(k, "FromDevice", -1);
-        });
-        uint32_t pcnt = (fm && il2cpp.method_get_param_count) ? il2cpp.method_get_param_count(fm) : 99;
-        if (pcnt <= 2) {
-            safeHook(k, "FromDevice", static_cast<int>(pcnt), (void*)hook_AuthFromDevice, (void**)&orig_AuthFromDevice, libBase, libEnd, "Auth.FromDevice");
-        } else {
-            LOGI("[hook] Auth.FromDevice: paramCount=%u skipped for ABI safety", pcnt);
-        }
-        safeHook(k, "FillSelfExtended", 0, (void*)hook_AuthFillExtended, (void**)&orig_AuthFillExtended, libBase, libEnd, "Auth.FillSelfExtended");
-    }
-    if (auto* k = findClassSafe(domain, "dev.Scripts.ECS.Morpeh.Features.SettingsFeature.Systems.SettingsServiceSystem")) {
-        safeHook(k, "GetDeviceId", 0, (void*)hook_SettingsGetDeviceId, (void**)&orig_SettingsGetDevId, libBase, libEnd, "Settings.GetDeviceId");
-    }
-}
-
-// Low-overhead patch loop: uses cached base address (no /proc/self/maps polling!)
-static void patchLoop() {
-    constexpr bool hasAnyOffset = (Offsets::InfiniteAmmo || Offsets::NoRecoil ||
-                                   Offsets::VehicleSpeed || Offsets::CameraFov);
-    while (true) {
-        uintptr_t base = g_libBase.load(std::memory_order_relaxed);
-        uintptr_t end  = g_libEnd.load(std::memory_order_relaxed);
-        if (base && end && F.deviceSpoof.load(std::memory_order_relaxed) &&
-            !F.spoofHooksInstalled.load(std::memory_order_relaxed) &&
-            !F.safeMode.load(std::memory_order_relaxed)) {
-            installSpoofHooksIfNeeded(base, end);
-        }
-        if (base && hasAnyOffset) {
-            GUARDED_RUN("patchLoop", {
-                if (F.infiniteAmmo.load(std::memory_order_relaxed) && Offsets::InfiniteAmmo)
-                    KittyMemory::writeValue<int>(base + Offsets::InfiniteAmmo, 9999);
-                if (F.noRecoil.load(std::memory_order_relaxed) && Offsets::NoRecoil)
-                    KittyMemory::writeValue<float>(base + Offsets::NoRecoil, 0.f);
-                if (F.vehicleSpeedOn.load(std::memory_order_relaxed) && Offsets::VehicleSpeed)
-                    KittyMemory::writeValue<float>(base + Offsets::VehicleSpeed, F.vehicleSpeed.load(std::memory_order_relaxed));
-                if (F.fovOverride.load(std::memory_order_relaxed) && Offsets::CameraFov)
-                    KittyMemory::writeValue<float>(base + Offsets::CameraFov, F.fov.load(std::memory_order_relaxed));
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        } else {
-            // Sleep longer when no raw offsets are active -> zero CPU/lag
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-    }
-}
-
-static void hackThread() {
-    LOGI("[init] background thread started (pid=%d)", getpid());
-    installHooksSafely();
-    patchLoop();
-}
-
 // ============================================================
 // JNI BRIDGE (com.bonika.modmenu.NativeBridge)
 // ============================================================
 #define JNI_FN(name) Java_com_bonika_modmenu_NativeBridge_##name
 extern "C" {
-JNIEXPORT void JNICALL JNI_FN(setEspEnabled)(JNIEnv*, jclass, jboolean v)           { F.esp = v; }
+JNIEXPORT void JNICALL JNI_FN(setEspEnabled)(JNIEnv*, jclass, jboolean v)           { F.esp = v; if (v) triggerGroupOnClick(GROUP_ESP); }
 JNIEXPORT void JNICALL JNI_FN(setEspDistance)(JNIEnv*, jclass, jfloat v)            { F.espDistance = v; }
-JNIEXPORT void JNICALL JNI_FN(setSkeletonEsp)(JNIEnv*, jclass, jboolean v)          { F.skeleton = v; }
+JNIEXPORT void JNICALL JNI_FN(setSkeletonEsp)(JNIEnv*, jclass, jboolean v)          { F.skeleton = v; if (v) triggerGroupOnClick(GROUP_ESP); }
 JNIEXPORT void JNICALL JNI_FN(setShowNpcs)(JNIEnv*, jclass, jboolean v)             { F.showNpcs = v; }
-JNIEXPORT void JNICALL JNI_FN(setShowVehicles)(JNIEnv*, jclass, jboolean v)         { F.showVehicles = v; }
+JNIEXPORT void JNICALL JNI_FN(setShowVehicles)(JNIEnv*, jclass, jboolean v)         { F.showVehicles = v; if (v) triggerGroupOnClick(GROUP_ESP); }
 JNIEXPORT void JNICALL JNI_FN(setEspBoxColor)(JNIEnv*, jclass, jint v)              { F.espBoxColor = v; }
 
-JNIEXPORT void JNICALL JNI_FN(setGodMode)(JNIEnv*, jclass, jboolean v)              { F.godMode = v; }
-JNIEXPORT void JNICALL JNI_FN(setInfiniteAmmo)(JNIEnv*, jclass, jboolean v)         { F.infiniteAmmo = v; }
-JNIEXPORT void JNICALL JNI_FN(setRapidFire)(JNIEnv*, jclass, jboolean v)            { F.rapidFire = v; }
-JNIEXPORT void JNICALL JNI_FN(setNoRecoil)(JNIEnv*, jclass, jboolean v)             { F.noRecoil = v; }
-JNIEXPORT void JNICALL JNI_FN(setSilentAim)(JNIEnv*, jclass, jboolean v)            { F.silentAim = v; }
-JNIEXPORT void JNICALL JNI_FN(setBulletWallhack)(JNIEnv*, jclass, jboolean v)       { F.bulletWallhack = v; }
-JNIEXPORT void JNICALL JNI_FN(setNoFallDamage)(JNIEnv*, jclass, jboolean v)         { F.noFallDamage = v; }
+JNIEXPORT void JNICALL JNI_FN(setGodMode)(JNIEnv*, jclass, jboolean v)              { F.godMode = v; if (v) triggerGroupOnClick(GROUP_HEALTH); }
+JNIEXPORT void JNICALL JNI_FN(setInfiniteAmmo)(JNIEnv*, jclass, jboolean v)         { F.infiniteAmmo = v; if (v) triggerGroupOnClick(GROUP_WEAPON); }
+JNIEXPORT void JNICALL JNI_FN(setRapidFire)(JNIEnv*, jclass, jboolean v)            { F.rapidFire = v; if (v) triggerGroupOnClick(GROUP_WEAPON); }
+JNIEXPORT void JNICALL JNI_FN(setNoRecoil)(JNIEnv*, jclass, jboolean v)             { F.noRecoil = v; if (v) triggerGroupOnClick(GROUP_WEAPON); }
+JNIEXPORT void JNICALL JNI_FN(setSilentAim)(JNIEnv*, jclass, jboolean v)            { F.silentAim = v; if (v) triggerGroupOnClick(GROUP_WEAPON); }
+JNIEXPORT void JNICALL JNI_FN(setBulletWallhack)(JNIEnv*, jclass, jboolean v)       { F.bulletWallhack = v; if (v) triggerGroupOnClick(GROUP_WEAPON); }
+JNIEXPORT void JNICALL JNI_FN(setNoFallDamage)(JNIEnv*, jclass, jboolean v)         { F.noFallDamage = v; if (v) triggerGroupOnClick(GROUP_HEALTH); }
 
-JNIEXPORT void JNICALL JNI_FN(setVehicleSpeedEnabled)(JNIEnv*, jclass, jboolean v)  { F.vehicleSpeedOn = v; }
+JNIEXPORT void JNICALL JNI_FN(setVehicleSpeedEnabled)(JNIEnv*, jclass, jboolean v)  { F.vehicleSpeedOn = v; if (v) triggerGroupOnClick(GROUP_VEH_STAMINA); }
 JNIEXPORT void JNICALL JNI_FN(setVehicleSpeedMultiplier)(JNIEnv*, jclass, jfloat v) { F.vehicleSpeed = v; }
-JNIEXPORT void JNICALL JNI_FN(setPlayerSpeedEnabled)(JNIEnv*, jclass, jboolean v)   { F.playerSpeedOn = v; }
+JNIEXPORT void JNICALL JNI_FN(setPlayerSpeedEnabled)(JNIEnv*, jclass, jboolean v)   { F.playerSpeedOn = v; if (v) triggerGroupOnClick(GROUP_CHAR_MOVE); }
 JNIEXPORT void JNICALL JNI_FN(setPlayerSpeedMultiplier)(JNIEnv*, jclass, jfloat v)  { F.playerSpeed = v; }
-JNIEXPORT void JNICALL JNI_FN(setSkyWalk)(JNIEnv*, jclass, jboolean v)              { F.skyWalk = v; }
-JNIEXPORT void JNICALL JNI_FN(setWalkOnAir)(JNIEnv*, jclass, jboolean v)            { F.walkOnAir = v; }
-JNIEXPORT void JNICALL JNI_FN(setAutoWalk)(JNIEnv*, jclass, jboolean v)             { F.autoWalk = v; }
-JNIEXPORT void JNICALL JNI_FN(setInfiniteStamina)(JNIEnv*, jclass, jboolean v)      { F.infiniteStamina = v; }
-JNIEXPORT void JNICALL JNI_FN(teleportToWaypoint)(JNIEnv*, jclass)                  { F.teleportRequested = true; }
-JNIEXPORT void JNICALL JNI_FN(setInstantBrake)(JNIEnv*, jclass, jboolean v)         { F.instantBrake = v; }
+JNIEXPORT void JNICALL JNI_FN(setSkyWalk)(JNIEnv*, jclass, jboolean v)              { F.skyWalk = v; if (v) triggerGroupOnClick(GROUP_CHAR_MOVE); }
+JNIEXPORT void JNICALL JNI_FN(setWalkOnAir)(JNIEnv*, jclass, jboolean v)            { F.walkOnAir = v; if (v) triggerGroupOnClick(GROUP_CHAR_MOVE); }
+JNIEXPORT void JNICALL JNI_FN(setAutoWalk)(JNIEnv*, jclass, jboolean v)             { F.autoWalk = v; if (v) triggerGroupOnClick(GROUP_POS_NAV); }
+JNIEXPORT void JNICALL JNI_FN(setInfiniteStamina)(JNIEnv*, jclass, jboolean v)      { F.infiniteStamina = v; if (v) triggerGroupOnClick(GROUP_VEH_STAMINA); }
+JNIEXPORT void JNICALL JNI_FN(teleportToWaypoint)(JNIEnv*, jclass)                  { F.teleportRequested = true; triggerGroupOnClick(GROUP_POS_NAV); }
+JNIEXPORT void JNICALL JNI_FN(setInstantBrake)(JNIEnv*, jclass, jboolean v)         { F.instantBrake = v; if (v) triggerGroupOnClick(GROUP_VEH_STAMINA); }
 
 JNIEXPORT void JNICALL JNI_FN(setFov)(JNIEnv*, jclass, jfloat v)                   { F.fov = v; }
-JNIEXPORT void JNICALL JNI_FN(setFovOverride)(JNIEnv*, jclass, jboolean v)          { F.fovOverride = v; }
-JNIEXPORT void JNICALL JNI_FN(setNightVision)(JNIEnv*, jclass, jboolean v)          { F.nightVision = v; }
-JNIEXPORT void JNICALL JNI_FN(setFreeFly)(JNIEnv*, jclass, jboolean v)              { F.freeFly = v; }
-JNIEXPORT void JNICALL JNI_FN(setFreeCam)(JNIEnv*, jclass, jboolean v)              { F.freeCam = v; }
-JNIEXPORT void JNICALL JNI_FN(setExtendedRange)(JNIEnv*, jclass, jboolean v)        { F.extendedRange = v; }
-JNIEXPORT void JNICALL JNI_FN(setHeadEnlarge)(JNIEnv*, jclass, jboolean v)          { F.headEnlarge = v; }
+JNIEXPORT void JNICALL JNI_FN(setFovOverride)(JNIEnv*, jclass, jboolean v)          { F.fovOverride = v; if (v) triggerGroupOnClick(GROUP_CAMERA); }
+JNIEXPORT void JNICALL JNI_FN(setNightVision)(JNIEnv*, jclass, jboolean v)          { F.nightVision = v; if (v) triggerGroupOnClick(GROUP_WORLD_RANGE); }
+JNIEXPORT void JNICALL JNI_FN(setFreeFly)(JNIEnv*, jclass, jboolean v)              { F.freeFly = v; if (v) triggerGroupOnClick(GROUP_CAMERA); }
+JNIEXPORT void JNICALL JNI_FN(setFreeCam)(JNIEnv*, jclass, jboolean v)              { F.freeCam = v; if (v) triggerGroupOnClick(GROUP_CAMERA); }
+JNIEXPORT void JNICALL JNI_FN(setExtendedRange)(JNIEnv*, jclass, jboolean v)        { F.extendedRange = v; if (v) triggerGroupOnClick(GROUP_WORLD_RANGE); }
+JNIEXPORT void JNICALL JNI_FN(setHeadEnlarge)(JNIEnv*, jclass, jboolean v)          { F.headEnlarge = v; if (v) triggerGroupOnClick(GROUP_CHAR_MOVE); }
 JNIEXPORT void JNICALL JNI_FN(setHeadScale)(JNIEnv*, jclass, jfloat v)              { F.headScale = v; }
 
-JNIEXPORT void JNICALL JNI_FN(setDeviceSpoof)(JNIEnv*, jclass, jboolean v)          { F.deviceSpoof = v; }
+JNIEXPORT void JNICALL JNI_FN(setDeviceSpoof)(JNIEnv*, jclass, jboolean v)          { F.deviceSpoof = v; if (v) triggerGroupOnClick(GROUP_SPOOF); }
 JNIEXPORT void JNICALL JNI_FN(regenerateSpoofId)(JNIEnv*, jclass) {
     F.spoofSeed.fetch_add(0x9E3779B9u, std::memory_order_relaxed);
     refreshSpoofHex(F.spoofSeed.load(std::memory_order_relaxed));
+    if (F.deviceSpoof.load(std::memory_order_relaxed)) {
+        triggerGroupOnClick(GROUP_SPOOF);
+    }
 }
 
 JNIEXPORT jboolean JNICALL JNI_FN(isHooked)(JNIEnv*, jclass)           { return F.hooked.load(); }
@@ -996,15 +1032,8 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(getPlayerPosition)(JNIEnv* env, jclass) {
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
-    bool expected = false;
-    if (g_initStarted.compare_exchange_strong(expected, true)) {
-        try {
-            std::thread(hackThread).detach();
-            LOGI("[init] JNI_OnLoad: worker spawned");
-        } catch (...) {
-            g_initStarted = false;
-        }
-    }
+    // Strictly idle on load: no threads, no IL2CPP resolution, no hooks until user clicks a button
+    LOGI("[init] JNI_OnLoad: idle (zero hooks until click)");
     return JNI_VERSION_1_6;
 }
 } // extern "C"
